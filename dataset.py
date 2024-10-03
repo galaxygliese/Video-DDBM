@@ -133,7 +133,7 @@ class NiftiImagePairedDataset(Dataset):
         plt.show()
 
     def __len__(self):
-        return len(self.inputfiles)
+        return len(self.input_files)
 
     def __getitem__(self, index):
         input_file = self.input_files[index]
