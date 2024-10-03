@@ -17,5 +17,7 @@ cd workspace
 ```
 export WANDB_API_KEY=****
 git config --global --add safe.directory /root/workspace
+pip install ninja 
+
 python3 train.py -e 10000 -b 16 --input_folder_path data/ct --target_folder_path data/mri --image_size 128 --image_depth 128 --save-per-epoch 500
 ```
