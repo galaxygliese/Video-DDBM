@@ -281,6 +281,18 @@ class DdbmEdmDenoiser(nn.Module):
         loss = mean_flat(lambdas*(D - x_start)**2)
         return loss
     
+    def forward(self, x_start:torch.Tensor, x_T:torch.Tensor, model_kwargs=None):
+        noise = torch.randn_like(x_start)
+        # sigmas = self.sample_sigmas(x_start)
+        sigmas = self.sample_sigmas_uniform(x_start)
+        x_t = self.get_ddbm_sample(x_0=x_start, x_T=x_T, noise=noise, sigmas=sigmas)
+        D = self.get_denoised(x_t, sigmas, x_T)
+        
+        lambdas = self.get_loss_weightings(sigmas)
+        lambdas = append_dims(lambdas, x_start.ndim)
+        loss = mean_flat(lambdas*(D - x_start)**2)
+        return loss.mean()
+    
     def get_dxdt(self, x_t:torch.Tensor, sigma_t:torch.Tensor, denoised_t:torch.Tensor, x_T:torch.Tensor, stochastic:bool=False, w:float=1):
         if self.sde_type == SDEType.VE:    
             grad_pxtlx0 = (denoised_t - x_t) / append_dims(sigma_t**2, x_t.ndim)

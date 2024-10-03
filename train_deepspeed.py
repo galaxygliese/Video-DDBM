@@ -22,14 +22,19 @@ import torch
 import numpy as np
 import random
 import wandb
+import json
 import copy
 import os
+
+# deepspeed
+import deepspeed
+from deepspeed.accelerator import get_accelerator
+
 
 parser = argparse.ArgumentParser()
 
 # General options
 parser.add_argument('-e', '--epochs', type=int, default=100)
-parser.add_argument('-b', '--batchsize', type=int, default=8)
 parser.add_argument('--generate-batchsize', type=int, default=1)
 parser.add_argument('--diffusion_timesteps', type=int, default=40) # Different from training -> Need to change?
 parser.add_argument('--lr', type=float, default=1e-4) # -> Need to change?
@@ -62,6 +67,8 @@ parser.add_argument('--resume', action='store_true')
 parser.add_argument('--resume_checkpoint', type=str)
 parser.add_argument('--resume_epochs', type=int, default=0)
 parser.add_argument('--seed', type=int, default=0)
+# parser = deepspeed.add_config_arguments(parser)
+parser.add_argument('--deepspeed_config', type=str, default="./configs/ds_config.json")
 opt = parser.parse_args()
 
 def seed_everything(seed=42):
@@ -122,6 +129,10 @@ def anneal_lr(step:int, optimizer, lr_anneal_steps:float = 0):
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
 
+def load_json(file_path):
+    with open(file_path, 'r') as file:
+        return json.load(file)
+
 def debug():
     device = 'cuda'
     attention_type = 'flash' if opt.half else 'vanilla' 
@@ -141,10 +152,9 @@ def debug():
     o = unet(x, t, xT=y)
     print(">", o.shape)
 
-def train(rank, world_size, run):
-    setup(rank, world_size)
-    device = rank
-    step = 0
+def train(args, run):
+    # Initialize DeepSpeed distributed backend.
+    deepspeed.init_distributed()
     
     transform = T.Compose([
         T.Lambda(lambda t: torch.tensor(t).float()),
@@ -160,25 +170,6 @@ def train(rank, world_size, run):
         depth_size=opt.image_depth, 
         transform=transform
     )
-    
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        seed=opt.seed
-    )
-    
-    # create dataloader
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=int(opt.batchsize // world_size),
-        shuffle=False,
-        sampler=sampler,
-        num_workers=0,
-        pin_memory=True,
-        drop_last=True
-    )
 
     num_diffusion_iters = opt.diffusion_timesteps   
     attention_type = 'flash' if opt.half else 'vanilla' 
@@ -189,7 +180,7 @@ def train(rank, world_size, run):
         in_channels=opt.in_channels,
         use_fp16=opt.half,
         attention_type=attention_type
-    ).to(device)
+    )
     print("UNET dtype:", unet.dtype)
     if opt.half:
         mp_trainer = MixedPrecisionTrainer(
@@ -197,23 +188,13 @@ def train(rank, world_size, run):
             use_fp16=True,
             fp16_scale_growth=1e-3,
         )
-    ddp_unet = DDP(
-        unet, 
-        device_ids=[rank],
-        output_device=rank,
-        broadcast_buffers=False,
-        bucket_cap_mb=128,
-        find_unused_parameters=False,
-    )
     model = DdbmEdmDenoiser(
-        unet=ddp_unet,
+        unet=unet,
         sigma_data=opt.sigma_data,
         sigma_min=opt.sigma_min,
         sigma_max=opt.sigma_max,
         rho=opt.rho,
-        device=device,
     )
-    model.to(device)
     
     if opt.half:
         ema_params = copy.deepcopy(mp_trainer.master_params)
@@ -226,6 +207,22 @@ def train(rank, world_size, run):
         # TODO: load EMA params
         print("Pretrained Model Loaded")
             
+    
+    # Define the network with DeepSpeed.
+    print(">", args)
+    model_engine, optimizer , trainloader, _ = deepspeed.initialize(
+        args=args,
+        model=model,
+        model_parameters=model.parameters(),
+        training_data=dataset
+    )
+    
+    local_device = get_accelerator().device_name(model_engine.local_rank)
+    local_rank = model_engine.local_rank
+    rank = dist.get_rank()
+    device = rank
+    step = 0
+    
     if rank == 0:
         batch = dataset[0]
         print("batch.shape:", batch[0].shape, batch[1].shape)
@@ -234,24 +231,15 @@ def train(rank, world_size, run):
         test_y = torch.cat([batch[1].unsqueeze(0)]*opt.generate_batchsize, 0).to(device)
         print("test y:", test_y.shape)
     
-    if opt.half:
-        optimizer = torch.optim.AdamW(
-            params=mp_trainer.master_params, 
-            lr=opt.lr, weight_decay=1e-6
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            params=ddp_unet.parameters(), 
-            lr=opt.lr, weight_decay=1e-6
-        )
+    # For float32, target_dtype will be None so no datatype conversion needed.
+    target_dtype = None
+    if model_engine.bfloat16_enabled():
+        target_dtype = torch.bfloat16
+    elif model_engine.fp16_enabled():
+        target_dtype = torch.half
     
-    # Cosine LR schedule with linear warmup
-    lr_scheduler = get_scheduler(
-        name='cosine',
-        optimizer=optimizer,
-        num_warmup_steps=opt.warmup_steps,
-        num_training_steps=len(dataloader) * opt.epochs
-    )
+    model_engine.train()
+    global_step = 0
     
     with tqdm(range(opt.resume_epochs, opt.epochs), desc='Epoch') as tglobal:
         # epoch loop
@@ -259,24 +247,21 @@ def train(rank, world_size, run):
             epoch_loss = list()
             model.unet.train()
             # batch loop
-            with tqdm(dataloader, desc='Batch', leave=False) as tepoch:
+            with tqdm(trainloader, desc='Batch', leave=False) as tepoch:
                 for nbatch in tepoch:
+                    global_step += 1
                     # data normalized in dataset
                     # device transfer
                     x, y = nbatch[0].to(device), nbatch[1].to(device)
                     B = x.shape[0]
                     
                     # sample a diffusion iteration for each data point
-                    loss = model.get_loss(x_start=x, x_T=y).mean()
+                    with torch.cuda.amp.autocast(cache_enabled=False):
+                        loss = model_engine(x_start=x, x_T=y)
 
                     # optimize
-                    loss.backward()
-                    optimizer.step()
-                    optimizer.zero_grad()
-        
-                    # step lr scheduler every batch
-                    # this is different from standard pytorch behavior
-                    lr_scheduler.step()
+                    model_engine.backward(loss)
+                    model_engine.step()
                     
                     if opt.half:
                         took_step = mp_trainer.optimize(optimizer)
@@ -294,26 +279,18 @@ def train(rank, world_size, run):
                 tglobal.set_postfix(loss=np.mean(epoch_loss))   
             
                 if (epoch_idx + 1) % opt.save_per_epoch == 0 and rank == 0:
-                    torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/training-3dddbm-edm-latent-diffusion-epoch{epoch_idx+1}'+'.pt')
-                    model.unet.eval()
+                    # torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/training-3dddbm-edm-latent-diffusion-epoch{epoch_idx+1}'+'.pt')
+                    model_engine.save_checkpoint(save_dir=opt.export_folder, tag=global_step)
 
                     # TODO: generate with ema model?
-                    generate(
-                        model=model,
-                        y=test_y,
-                        num_diffusion_iters=num_diffusion_iters,
-                        export_name=f"{opt.export_folder}/epoch{epoch_idx+1}.nii.gz",
-                        # sample_num=4
-                    )
-    torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/final-3dddbm-edm-latent-diffusion-epoch{epoch_idx+1}'+'.pt')
-    model.unet.eval()
-    generate(
-        model=model,
-        y=test_y,
-        num_diffusion_iters=num_diffusion_iters,
-        export_name=f"{opt.export_folder}/epoch{epoch_idx+1}.nii.gz",
-    )
-    cleanup()
+                    # generate(
+                    #     model=model,
+                    #     y=test_y,
+                    #     num_diffusion_iters=num_diffusion_iters,
+                    #     export_name=f"{opt.export_folder}/epoch{epoch_idx+1}.nii.gz",
+                    #     # sample_num=4
+                    # )
+    model_engine.save_checkpoint(save_dir=opt.export_folder, tag=global_step)
 
 if __name__ == '__main__':
     world_size = torch.cuda.device_count()
@@ -322,7 +299,6 @@ if __name__ == '__main__':
     run = wandb.init(project = '3dddbm', resume = opt.resume)
     config = run.config
     config.epochs = opt.epochs
-    config.batchsize = opt.batchsize
     config.learning_rate = opt.lr 
     config.diffusion_timesteps = opt.diffusion_timesteps
 
@@ -333,6 +309,6 @@ if __name__ == '__main__':
     config.sigma_sample_density_mean = opt.sigma_sample_density_mean
     config.sigma_sample_density_std = opt.sigma_sample_density_std
     
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    mp.spawn(train, args=(world_size, run), nprocs=world_size, join=True)
+
+    # mp.spawn(train, args=(world_size, run), nprocs=world_size, join=True)
+    train(opt, run)
