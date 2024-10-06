@@ -55,7 +55,7 @@ RUN wget "https://github.com/conda-forge/miniforge/releases/latest/download/Mamb
     conda init zsh && \
     source /root/.zshrc && \
     mamba env create -f /root/conda_environment.yaml && \
-    echo 'conda activate 3dddbm' >> /root/.zshrc
+    echo 'conda activate video_ddbm' >> /root/.zshrc
 
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8

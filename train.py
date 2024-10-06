@@ -4,9 +4,11 @@ from diffusion.fp16_util import MixedPrecisionTrainer
 from diffusers.optimization import get_scheduler
 from diffusion import DdbmEdmDenoiser
 from diffusion.unet3d import create_unet_model
-from dataset import NiftiImagePairedDataset
+from dataset import MovingMNIST
 
+from torch_ema import ExponentialMovingAverage
 from torchvision import transforms as T
+from torchvision.io import write_video
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from functools import partial
@@ -42,10 +44,9 @@ parser.add_argument('--ema-rate', type=float, default=0.99) # -> Need to change?
 parser.add_argument('--half', action='store_true')
 
 # Dataset options
-parser.add_argument('--input_folder_path', type=str)
-parser.add_argument('--target_folder_path', type=str)
-parser.add_argument('--image_size', type=int, default=128)
-parser.add_argument('--image_depth', type=int, default=128)
+parser.add_argument('--data_path', type=str)
+parser.add_argument('--image_size', type=int, default=64)
+parser.add_argument('--image_depth', type=int, default=10)
 parser.add_argument('--in_channels', type=int, default=1)
 parser.add_argument('--out_channels', type=int, default=1)
 
@@ -97,10 +98,10 @@ def generate(
         nimage = ((nimage + 1) * 0.5).clamp(0, 1) # (B, C, D, H, W)
         imgs = nimage.detach().to('cpu').numpy()
         
-        img = imgs[0][0]
-
-    nifti_img = nib.Nifti1Image(img, affine=np.eye(4))
-    nib.save(nifti_img, export_name)
+        video = 255*0.5*(nimage.permute(0, 2, 1, 3, 4).detach().to('cpu') + 1)[0]
+        video = video.repeat(1, 3, 1, 1)
+        video = video.permute(0, 2, 3, 1)
+    write_video(export_name, video, fps=5)
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -148,16 +149,14 @@ def train(rank, world_size, run):
     
     transform = T.Compose([
         T.Lambda(lambda t: torch.tensor(t).float()),
-        T.Lambda(lambda t: t.unsqueeze(0)), # add channel
-        T.Lambda(lambda t: (t * 2) - 1), # img in [-1, 1] normalizing any case -> max min ranges depend on the cases of the sizes?
-        T.Lambda(lambda t: t.permute(0, 3, 1, 2)), # HWD -> DHW
+        T.Lambda(lambda t: (t / 255. * 2) - 1), # img in [-1, 1] normalizing
+        T.Lambda(lambda t: t.permute(1, 0, 2, 3)), # TCHW -> CTHW
     ])
     
-    dataset = NiftiImagePairedDataset(
-        input_folder_path=opt.input_folder_path, 
-        target_folder_path=opt.target_folder_path, 
-        input_size=opt.image_size, 
-        depth_size=opt.image_depth, 
+    dataset = MovingMNIST(
+        data_file=opt.data_path, 
+        # input_size=opt.image_size, 
+        num_frames=opt.image_depth, 
         transform=transform
     )
     
@@ -252,6 +251,8 @@ def train(rank, world_size, run):
         num_warmup_steps=opt.warmup_steps,
         num_training_steps=len(dataloader) * opt.epochs
     )
+
+    ema = ExponentialMovingAverage(model.parameters(), decay=opt.ema_rate)
     
     with tqdm(range(opt.resume_epochs, opt.epochs), desc='Epoch') as tglobal:
         # epoch loop
@@ -278,12 +279,13 @@ def train(rank, world_size, run):
                     # this is different from standard pytorch behavior
                     lr_scheduler.step()
                     
-                    if opt.half:
-                        took_step = mp_trainer.optimize(optimizer)
-                        if took_step:
-                            update_ema(mp_trainer, ema_params, ema_rate=opt.ema_rate)
+                    # if opt.half:
+                    #     took_step = mp_trainer.optimize(optimizer)
+                    #     if took_step:
+                    #         update_ema(mp_trainer, ema_params, ema_rate=opt.ema_rate)
                     # anneal_lr(step, optimizer)
                     step += 1
+                    ema.update()
 
                     # logging
                     loss_cpu = loss.item()
@@ -296,15 +298,14 @@ def train(rank, world_size, run):
                 if (epoch_idx + 1) % opt.save_per_epoch == 0 and rank == 0:
                     torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/training-3dddbm-edm-latent-diffusion-epoch{epoch_idx+1}'+'.pt')
                     model.unet.eval()
-
-                    # TODO: generate with ema model?
-                    generate(
-                        model=model,
-                        y=test_y,
-                        num_diffusion_iters=num_diffusion_iters,
-                        export_name=f"{opt.export_folder}/epoch{epoch_idx+1}.nii.gz",
-                        # sample_num=4
-                    )
+                    with ema.average_parameters():
+                        generate(
+                            model=model,
+                            y=test_y,
+                            num_diffusion_iters=num_diffusion_iters,
+                            export_name=f"{opt.export_folder}/epoch{epoch_idx+1}.mp4",
+                            # sample_num=4
+                        )
     torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/final-3dddbm-edm-latent-diffusion-epoch{epoch_idx+1}'+'.pt')
     model.unet.eval()
     generate(
@@ -319,7 +320,7 @@ if __name__ == '__main__':
     world_size = torch.cuda.device_count()
     
     # TODO: fix wandb resume
-    run = wandb.init(project = '3dddbm', resume = opt.resume)
+    run = wandb.init(project = 'video_ddbm', resume = opt.resume)
     config = run.config
     config.epochs = opt.epochs
     config.batchsize = opt.batchsize
