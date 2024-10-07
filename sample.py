@@ -64,10 +64,11 @@ def generate(
         for i in range(sample_num):
             nimage, path = model.sample(y, steps=num_diffusion_iters)
             
-            nimage = ((nimage + 1) * 0.5).clamp(0, 1) # (B, C, D, H, W)
             y = nimage
+            # nimage = ((nimage + 1) * 0.5).clamp(0, 1) # (B, C, T, H, W) [-1, 1] to [0, 1]
             
-            video = 255*0.5*(nimage.permute(0, 2, 1, 3, 4).detach().to('cpu') + 1)[0]
+            video = 0.5*(nimage.permute(0, 2, 1, 3, 4).detach().to('cpu') + 1).clamp(0, 1)[0]
+            video = 255*video
             video = video.repeat(1, 3, 1, 1)
             video = video.permute(0, 2, 3, 1).numpy()
             if videos is None:
