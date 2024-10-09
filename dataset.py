@@ -34,6 +34,31 @@ class MovingMNIST(Dataset):
             y = self.transform(y)
         return x, y
     
+class MovingMNISTSteps(Dataset):
+    def __init__(self, data_file:str, num_frames:int=5, transform=None):
+        super().__init__()
+        self.data_file = data_file
+        self.datas = np.load(data_file)
+        # (t, N, H, W) -> (N, t, C, H, W)
+        self.datas = self.datas.transpose(1, 0, 2, 3)[:, :, None, ...]
+        self.num_frames = num_frames
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.datas)
+    
+    def __getitem__(self, index):
+        y1 = self.datas[index, :self.num_frames, ...].astype(np.int32) # = x_T
+        x1 = self.datas[index, self.num_frames:self.num_frames*2, ...].astype(np.int32) # = x_0
+        y2 = self.datas[index, self.num_frames*2:self.num_frames*3, ...].astype(np.int32) # = x_T
+        x2 = self.datas[index, self.num_frames*3:, ...].astype(np.int32) # = x_0
+        if self.transform is not None:
+            x1 = self.transform(x1)
+            y1 = self.transform(y1)
+            x2 = self.transform(x2)
+            y2 = self.transform(y2)
+        return x1, y1, x2, y2
+    
 if __name__ == '__main__':
     transform = T.Compose([
         T.Lambda(lambda t: torch.tensor(t).float()),
