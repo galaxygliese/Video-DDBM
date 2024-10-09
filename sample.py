@@ -27,6 +27,7 @@ parser.add_argument('-d', '--device', type=int, default=0)
 parser.add_argument('-w', '--weight_path', type=str, default="./checkpoints/")
 parser.add_argument('--sample_num', type=int, default=4)
 parser.add_argument('--half', action='store_true')
+parser.add_argument('--sw', action='store_true')
 
 # Dataset options
 parser.add_argument('--dataset_path', type=str, default="./datas/val")
@@ -60,22 +61,58 @@ def generate(
     # B = sample_num
     videos = None
     with torch.no_grad():
+        video_0 = 0.5*(y.permute(0, 2, 1, 3, 4).detach().to('cpu') + 1).clamp(0, 1)[0]
+        video_0 = 255*video_0
+        video_0 = video_0.repeat(1, 3, 1, 1)
+        video_0 = video_0.permute(0, 2, 3, 1).numpy()
+        videos =  video_0 # 
         # initialize action from Guassian noise
         for i in range(sample_num):
             nimage, path = model.sample(y, steps=num_diffusion_iters)
             
             y = nimage
-            # nimage = ((nimage + 1) * 0.5).clamp(0, 1) # (B, C, T, H, W) [-1, 1] to [0, 1]
             
-            video = 0.5*(nimage.permute(0, 2, 1, 3, 4).detach().to('cpu') + 1).clamp(0, 1)[0]
+            video = 0.5*(nimage.permute(0, 2, 1, 3, 4).detach().to('cpu') + 1).clamp(0, 1)[0] # (B, C, T, H, W) to (B, T, C, H, W)
             video = 255*video
             video = video.repeat(1, 3, 1, 1)
             video = video.permute(0, 2, 3, 1).numpy()
-            if videos is None:
-                videos = video 
-            else:
-                print(">", videos.shape, video.shape)
-                videos = np.concatenate([videos, video])
+            videos = np.concatenate([videos, video])
+            print(">", videos.shape)
+        
+    write_video(export_name, videos, fps=5)
+    
+@torch.no_grad()
+def generate_overlap(
+        model:DdbmEdmDenoiser, 
+        y: torch.Tensor,
+        num_diffusion_iters:int, 
+        export_name:str, 
+        sample_num:int,
+        fps:int=5, 
+        depth:int=10,
+        device:str='cuda'
+    ):
+    with torch.no_grad():
+        video_0 = 0.5*(y.permute(0, 2, 1, 3, 4).detach().to('cpu') + 1).clamp(0, 1)[0]
+        video_0 = 255*video_0
+        video_0 = video_0.repeat(1, 3, 1, 1)
+        video_0 = video_0.permute(0, 2, 3, 1).numpy()
+        videos =  video_0 # 
+        # initialize action from Guassian noise
+        for i in range(sample_num):
+            # y: (B, C, T, H, W) 
+            nimage, path = model.sample(y, steps=num_diffusion_iters)
+            
+            half_y = y[:,:,depth//2:, ...]
+            half_nimage = nimage[:,:,:depth//2, ...]
+            y = torch.cat([half_y, half_nimage], dim=2)
+            
+            video = 0.5*(nimage.permute(0, 2, 1, 3, 4).detach().to('cpu') + 1).clamp(0, 1)[0] # (B, C, T, H, W) to (B, T, C, H, W)
+            video = 255*video
+            video = video.repeat(1, 3, 1, 1) # (T, C, H, W)
+            video = video.permute(0, 2, 3, 1).numpy() # (T, H, W, C)
+            videos = np.concatenate([videos, video[:depth//2, ...]])
+            print(">", videos.shape)
         
     write_video(export_name, videos, fps=5)
 
@@ -101,6 +138,7 @@ def main():
     )
     model.eval()
     print("Model Loaded!")
+    print("Using Sliding Window Sampling:", opt.sw)
     
     transform = T.Compose([
         T.Lambda(lambda t: torch.tensor(t).float()),
@@ -133,13 +171,22 @@ def main():
     test_x, test_y = batch[0], batch[1]
     test_y = test_y.to(device)
     
-    generate(
-        model=model,
-        y=test_y,
-        num_diffusion_iters=opt.diffusion_timesteps,
-        export_name=f"data/sample.mp4",
-        sample_num=opt.sample_num
-    )
+    if not opt.sw:
+        generate(
+            model=model,
+            y=test_y,
+            num_diffusion_iters=opt.diffusion_timesteps,
+            export_name=f"data/sample.mp4",
+            sample_num=opt.sample_num
+        )
+    else:
+        generate_overlap(
+            model=model,
+            y=test_y,
+            num_diffusion_iters=opt.diffusion_timesteps,
+            export_name=f"data/sample.mp4",
+            sample_num=opt.sample_num
+        )
     print('Done!')
     
 if __name__ == '__main__':
