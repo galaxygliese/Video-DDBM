@@ -4,7 +4,7 @@ version: "3.9"
 
 services:
   latest:
-    runtime: nvidia
+    # runtime: nvidia
     build:
       context: .
       dockerfile: Dockerfile
@@ -24,3 +24,8 @@ services:
       # For debugging with Hydra
       - HYDRA_FULL_ERROR=1
     command: ./workspace/docker/initialize-docker-container.sh
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]

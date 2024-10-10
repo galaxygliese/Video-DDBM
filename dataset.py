@@ -1,7 +1,6 @@
 #-*- coding:utf-8 -*-
 
 from sklearn.preprocessing import MinMaxScaler
-from torchvision.datasets import MovingMNIST
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 from glob import glob
