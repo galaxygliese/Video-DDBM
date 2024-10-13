@@ -651,12 +651,12 @@ class LabelEmbedder(nn.Module):
         self.num_classes = num_classes
         self.dropout_prob = dropout_prob
 
-    def token_drop(self, labels, force_drop_ids=None):
+    def token_drop(self, labels, force_drop_ids=None, device='cuda'):
         """
         Drops labels to enable classifier-free guidance.
         """
         if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0]).cuda() < self.dropout_prob
+            drop_ids = torch.rand(labels.shape[0]).to(device) < self.dropout_prob
         else:
             drop_ids = force_drop_ids == 1
         labels = torch.where(drop_ids, self.num_classes, labels)
@@ -665,7 +665,7 @@ class LabelEmbedder(nn.Module):
     def forward(self, labels, train, force_drop_ids=None):
         use_dropout = self.dropout_prob > 0
         if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
+            labels = self.token_drop(labels, force_drop_ids, device=labels.device)
         return self.embedding_table(labels)
 
 
@@ -730,12 +730,12 @@ class CaptionEmbedder(nn.Module):
         )
         self.uncond_prob = uncond_prob
 
-    def token_drop(self, caption, force_drop_ids=None):
+    def token_drop(self, caption, force_drop_ids=None, device='cuda'):
         """
         Drops labels to enable classifier-free guidance.
         """
         if force_drop_ids is None:
-            drop_ids = torch.rand(caption.shape[0]).cuda() < self.uncond_prob
+            drop_ids = torch.rand(caption.shape[0]).to(device) < self.uncond_prob
         else:
             drop_ids = force_drop_ids == 1
         caption = torch.where(drop_ids[:, None, None, None], self.y_embedding, caption)
@@ -746,7 +746,7 @@ class CaptionEmbedder(nn.Module):
             assert caption.shape[2:] == self.y_embedding.shape
         use_dropout = self.uncond_prob > 0
         if (train and use_dropout) or (force_drop_ids is not None):
-            caption = self.token_drop(caption, force_drop_ids)
+            caption = self.token_drop(caption, force_drop_ids, device=caption.device)
         caption = self.y_proj(caption)
         return caption
 
