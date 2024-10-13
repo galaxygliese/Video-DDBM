@@ -311,7 +311,7 @@ def train(rank, world_size, run):
         model=model,
         y=test_y,
         num_diffusion_iters=num_diffusion_iters,
-        export_name=f"{opt.export_folder}/epoch{epoch_idx+1}.nii.gz",
+        export_name=f"{opt.export_folder}/final_epoch{epoch_idx+1}.mp4",
     )
     cleanup()
 
