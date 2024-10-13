@@ -2,27 +2,23 @@
 
 from diffusion.fp16_util import MixedPrecisionTrainer
 from diffusers.optimization import get_scheduler
-from diffusion import DdbmEdmDenoiser
-from diffusion.unet3d import create_unet_model
+from dit.dit import DiT_S_2
 from dataset import MovingMNIST
+from diffusion import DdbmEdmDenoiser
+from diffusers.models import AutoencoderKL
 
 from torch_ema import ExponentialMovingAverage
 from torchvision import transforms as T
 from torchvision.io import write_video
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from functools import partial
-from PIL import Image
 from tqdm.auto import tqdm
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import dill as pickle
-import nibabel as nib
-import torchio as tio
 import argparse
-import torch 
 import numpy as np
-import random
+import random 
+import torch
 import wandb
 import copy
 import os
@@ -84,6 +80,7 @@ def rand_log_normal(shape, loc=0., scale=1., device='cuda', dtype=torch.float32)
 @torch.no_grad()
 def generate(
         model:DdbmEdmDenoiser, 
+        vae:AutoencoderKL,
         y: torch.Tensor,
         num_diffusion_iters:int, 
         export_name:str, 
@@ -93,14 +90,100 @@ def generate(
     # B = sample_num
     with torch.no_grad():
         # initialize action from Guassian noise
-        nimage, path = model.sample(y, steps=num_diffusion_iters)
-        
+        z_y = vae_encode(y, vae)
+        z, path = model.sample(
+            z_y, 
+            steps=num_diffusion_iters
+        )
+        nimage = vae_decode(z, vae)
         nimage = ((nimage + 1) * 0.5).clamp(0, 1) # (B, C, D, H, W)
         
         video = 255*nimage.permute(0, 2, 1, 3, 4).detach().to('cpu')[0]
-        video = video.repeat(1, 3, 1, 1)
+        # video = video.repeat(1, 3, 1, 1)
         video = video.permute(0, 2, 3, 1)
     write_video(export_name, video, fps=5)
+
+@torch.no_grad()
+def vae_encode(
+        x:torch.Tensor, 
+        vae:AutoencoderKL,
+        VAE_CHANNEL:int = 4,
+        VAE_DOWN_SAMPLE:int = 8
+    ) -> torch.Tensor:
+    B, C, T, H, W = x.shape
+    if C == 1:
+        C = 3
+        x = x.repeat(1, 3, 1, 1, 1)
+    x = x.permute(0, 2, 1, 3, 4) # (B, C, T, H, W) -> (B, T, C, H, W)
+    x = x.reshape(B*T, C, H, W)
+    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+    x = x.reshape(B, T, VAE_CHANNEL, H//VAE_DOWN_SAMPLE, W//VAE_DOWN_SAMPLE)
+    # x = x.reshape(B, T, VAE_CHANNEL, -1)
+    x = x.permute(0, 2, 1, 3, 4) # (B, T, C, D) -> (B, C, T, D)
+    return x
+
+@torch.no_grad()
+def vae_decode(
+        z:torch.Tensor,
+        vae:AutoencoderKL,
+        input_channel:int = 3,
+        input_height:int = 64,
+        input_width:int = 64
+    ) -> torch.Tensor:
+    B, C, T, PH, PW = z.shape
+    z = z.permute(0, 2, 1, 3, 4) # (B, C, T, H, W) -> (B, T, C, H, W)
+    z = z.reshape(B*T, C, PH, PW)
+    samples = vae.decode(z / 0.18215).sample
+    x = samples.reshape(B, T, input_channel, input_height, input_width)
+    x = x.permute(0, 2, 1, 3, 4)
+    return x
+
+def debug():
+    device = 'cuda'
+    attention_type = 'flash' if opt.half else 'vanilla' 
+    model = DiT_S_2(
+        in_channels=4,
+        input_size=(opt.image_depth, opt.image_size // 8, opt.image_size // 8),
+        condition='label', # To ignore text_encoder
+        learn_sigma=False,
+    ).to(device) 
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+    print("Model Loaded!")
+
+    x = torch.randn(1, 3, 10, 64, 64).to(device)
+    y = torch.randn(1, 3, 10, 64, 64).to(device)
+    t = torch.tensor([80.0]).to(device)
+    label = torch.tensor([0]).to(device)
+
+    x = vae_encode(x, vae)
+    y = vae_encode(y, vae)
+    o = model(x, t, xT=y)
+    print(">", o.shape)
+    g = vae_decode(o, vae)
+    print(">>", g.shape)
+    g = ((g + 1) * 0.5).clamp(0, 1)
+    video = 255*g.permute(0, 2, 1, 3, 4).detach().to('cpu')[0]
+    # video = video.repeat(1, 3, 1, 1)
+    video = video.permute(0, 2, 3, 1)
+    print(">", video.shape)
+    # write_video("./data/dit_sample.mp4", video, fps=5)
+    y = torch.randn(1, 3, 10, 64, 64).to(device)
+    model = DdbmEdmDenoiser(
+        unet=model,
+        sigma_data=opt.sigma_data,
+        sigma_min=opt.sigma_min,
+        sigma_max=opt.sigma_max,
+        rho=opt.rho,
+        device=device,
+    )
+    generate(
+        model, 
+        vae, 
+        y=y, 
+        num_diffusion_iters=opt.diffusion_timesteps,
+        export_name="./data/dit_sample.mp4"
+    )
+
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -121,25 +204,6 @@ def anneal_lr(step:int, optimizer, lr_anneal_steps:float = 0):
     lr = opt.lr * (1 - frac_done)
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
-
-def debug():
-    device = 'cuda'
-    attention_type = 'flash' if opt.half else 'vanilla' 
-    unet = create_unet_model(
-        image_size=opt.image_size,
-        num_channels=opt.num_channels,
-        num_res_blocks=opt.num_res_blocks,
-        in_channels=opt.in_channels,
-        use_fp16=opt.half,
-        attention_type=attention_type
-    ).to(device) 
-    print("Model Loaded!")
-
-    x = torch.randn(1, 1, 64, 64, 64).to(device)
-    y = torch.randn(1, 1, 64, 64, 64).to(device)
-    t = torch.tensor([80.0]).to(device)
-    o = unet(x, t, xT=y)
-    print(">", o.shape)
 
 def train(rank, world_size, run):
     setup(rank, world_size)
@@ -180,23 +244,21 @@ def train(rank, world_size, run):
 
     num_diffusion_iters = opt.diffusion_timesteps   
     attention_type = 'flash' if opt.half else 'vanilla' 
-    unet = create_unet_model(
-        image_size=opt.image_size,
-        num_channels=opt.num_channels,
-        num_res_blocks=opt.num_res_blocks,
-        in_channels=opt.in_channels,
-        use_fp16=opt.half,
-        attention_type=attention_type
-    ).to(device)
-    print("UNET dtype:", unet.dtype)
+    model = DiT_S_2(
+        in_channels=4,
+        input_size=(opt.image_depth, opt.image_size // 8, opt.image_size // 8),
+        condition='label', # To ignore text_encoder
+        learn_sigma=False,
+    ).to(device) 
+    print("Model dtype:", model.dtype)
     if opt.half:
         mp_trainer = MixedPrecisionTrainer(
-            model=unet,
+            model=model,
             use_fp16=True,
             fp16_scale_growth=1e-3,
         )
-    ddp_unet = DDP(
-        unet, 
+    ddp_model = DDP(
+        model, 
         device_ids=[rank],
         output_device=rank,
         broadcast_buffers=False,
@@ -204,7 +266,7 @@ def train(rank, world_size, run):
         find_unused_parameters=False,
     )
     model = DdbmEdmDenoiser(
-        unet=ddp_unet,
+        unet=ddp_model,
         sigma_data=opt.sigma_data,
         sigma_min=opt.sigma_min,
         sigma_max=opt.sigma_max,
@@ -213,9 +275,8 @@ def train(rank, world_size, run):
     )
     model.to(device)
     
-    if opt.half:
-        ema_params = copy.deepcopy(mp_trainer.master_params)
-    print("Model Loaded!")
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+    print("Models Loaded!")
     
     if opt.resume:
         state_dict = torch.load(opt.resume_checkpoint, map_location='cuda')
@@ -232,16 +293,10 @@ def train(rank, world_size, run):
         test_y = torch.cat([batch[1].unsqueeze(0)]*opt.generate_batchsize, 0).to(device)
         print("test y:", test_y.shape)
     
-    if opt.half:
-        optimizer = torch.optim.AdamW(
-            params=mp_trainer.master_params, 
-            lr=opt.lr, weight_decay=1e-6
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            params=ddp_unet.parameters(), 
-            lr=opt.lr, weight_decay=1e-6
-        )
+    optimizer = torch.optim.AdamW(
+        params=ddp_model.parameters(), 
+        lr=opt.lr, weight_decay=1e-6
+    )
     
     # Cosine LR schedule with linear warmup
     lr_scheduler = get_scheduler(
@@ -265,6 +320,8 @@ def train(rank, world_size, run):
                     # device transfer
                     x, y = nbatch[0].to(device), nbatch[1].to(device)
                     B = x.shape[0]
+                    x = vae_encode(x, vae=vae)
+                    y = vae_encode(y, vae=vae)
                     
                     # sample a diffusion iteration for each data point
                     loss = model.get_loss(x_start=x, x_T=y).mean()
@@ -278,11 +335,6 @@ def train(rank, world_size, run):
                     # this is different from standard pytorch behavior
                     lr_scheduler.step()
                     
-                    # if opt.half:
-                    #     took_step = mp_trainer.optimize(optimizer)
-                    #     if took_step:
-                    #         update_ema(mp_trainer, ema_params, ema_rate=opt.ema_rate)
-                    # anneal_lr(step, optimizer)
                     step += 1
                     ema.update()
 
@@ -295,31 +347,35 @@ def train(rank, world_size, run):
                 tglobal.set_postfix(loss=np.mean(epoch_loss))   
             
                 if (epoch_idx + 1) % opt.save_per_epoch == 0 and rank == 0:
-                    torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/training-3dddbm-edm-latent-diffusion-epoch{epoch_idx+1}'+'.pt')
+                    torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/training-3dddbm-dit-epoch{epoch_idx+1}'+'.pt')
                     model.unet.eval()
                     with ema.average_parameters():
                         generate(
                             model=model,
+                            vae=vae,
                             y=test_y,
                             num_diffusion_iters=num_diffusion_iters,
-                            export_name=f"{opt.export_folder}/epoch{epoch_idx+1}.mp4",
+                            export_name=f"{opt.export_folder}/dit_epoch{epoch_idx+1}.mp4",
                             # sample_num=4
                         )
-    torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/final-3dddbm-edm-latent-diffusion-epoch{epoch_idx+1}'+'.pt')
+    torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/final-3dddbm-dit-epoch{epoch_idx+1}'+'.pt')
     model.unet.eval()
     generate(
         model=model,
+        vae=vae,
         y=test_y,
         num_diffusion_iters=num_diffusion_iters,
         export_name=f"{opt.export_folder}/final_epoch{epoch_idx+1}.mp4",
     )
     cleanup()
+        
+
 
 if __name__ == '__main__':
     world_size = torch.cuda.device_count()
     
     # TODO: fix wandb resume
-    run = wandb.init(project = 'video_ddbm', resume = opt.resume)
+    run = wandb.init(project = 'video_ddbm_dit', resume = opt.resume)
     config = run.config
     config.epochs = opt.epochs
     config.batchsize = opt.batchsize

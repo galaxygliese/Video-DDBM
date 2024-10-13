@@ -6,7 +6,7 @@ import torch
 import numpy as np
 from torch import nn
 from tqdm.auto import trange
-from typing import Union, List
+from typing import Union, Optional
 from functools import partial
 from enum import Enum
 from .model import SongUNet
