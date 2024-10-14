@@ -312,3 +312,16 @@ def DiT_S_2(from_pretrained=None, **kwargs):
         # load_checkpoint(model, from_pretrained)
         raise NotImplementedError
     return model
+
+def DiT_B_2(from_pretrained=None, **kwargs):
+    model = DiT(
+        depth=12,
+        hidden_size=768,
+        patch_size=(1, 2, 2),
+        num_heads=12,
+        **kwargs,
+    )
+    if from_pretrained is not None:
+        # load_checkpoint(model, from_pretrained)
+        raise NotImplementedError
+    return model

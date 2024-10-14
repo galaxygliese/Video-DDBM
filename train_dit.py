@@ -345,6 +345,9 @@ def train(rank, world_size, run):
                 if rank == 0:
                     run.log({"train-loss": np.mean(epoch_loss)})
                 tglobal.set_postfix(loss=np.mean(epoch_loss))   
+
+                if (epoch_idx + 1) % opt.save_per_epoch == 0 and rank != 0:
+                    dist.barrier()
             
                 if (epoch_idx + 1) % opt.save_per_epoch == 0 and rank == 0:
                     torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/training-3dddbm-dit-epoch{epoch_idx+1}'+'.pt')
@@ -358,15 +361,17 @@ def train(rank, world_size, run):
                             export_name=f"{opt.export_folder}/dit_epoch{epoch_idx+1}.mp4",
                             # sample_num=4
                         )
-    torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/final-3dddbm-dit-epoch{epoch_idx+1}'+'.pt')
-    model.unet.eval()
-    generate(
-        model=model,
-        vae=vae,
-        y=test_y,
-        num_diffusion_iters=num_diffusion_iters,
-        export_name=f"{opt.export_folder}/final_epoch{epoch_idx+1}.mp4",
-    )
+                    dist.barrier() 
+    if rank == 0:
+        torch.save(model.unet.module.state_dict(), f'{opt.export_folder}/final-3dddbm-dit-epoch{epoch_idx+1}'+'.pt')
+        model.unet.eval()
+        generate(
+            model=model,
+            vae=vae,
+            y=test_y,
+            num_diffusion_iters=num_diffusion_iters,
+            export_name=f"{opt.export_folder}/final_epoch{epoch_idx+1}.mp4",
+        )
     cleanup()
         
 
